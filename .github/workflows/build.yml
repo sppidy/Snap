@@ -1,0 +1,76 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-26
+    permissions:
+      contents: write # create releases on tags
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Select newest Xcode
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -vi beta | sort -V | tail -1)
+          if [ -n "$XCODE" ]; then sudo xcode-select -s "$XCODE"; fi
+          xcodebuild -version
+
+      - name: Import signing certificate
+        env:
+          SPIDY_CERT_PEM: ${{ secrets.SPIDY_CERT_PEM }}
+        run: |
+          if [ -z "$SPIDY_CERT_PEM" ]; then
+            echo "::warning::SPIDY_CERT_PEM secret not available; building ad-hoc signed."
+            exit 0
+          fi
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KC_PASS=$(openssl rand -hex 24)
+          P12_PASS=$(openssl rand -hex 24)
+          umask 077
+          printf '%s\n' "$SPIDY_CERT_PEM" > "$RUNNER_TEMP/spidy.pem"
+          # System LibreSSL writes a PKCS#12 that `security import` accepts.
+          /usr/bin/openssl pkcs12 -export -in "$RUNNER_TEMP/spidy.pem" -name spidy \
+            -out "$RUNNER_TEMP/spidy.p12" -passout pass:"$P12_PASS"
+          security create-keychain -p "$KC_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KC_PASS" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/spidy.p12" -k "$KEYCHAIN" -P "$P12_PASS" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASS" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/spidy.pem" "$RUNNER_TEMP/spidy.p12"
+          security find-identity -p codesigning "$KEYCHAIN"
+
+      - name: Build DMG
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            export SNAP_VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          export SNAP_BUILD="$GITHUB_RUN_NUMBER"
+          ./build.sh dmg
+          codesign -dvv build/Snap.app 2>&1 | grep -E "^(Authority|Signature)" || true
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: Snap
+          path: build/Snap.dmg
+          if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" build/Snap.dmg \
+            --title "Snap $GITHUB_REF_NAME" \
+            --verify-tag --generate-notes \
+            --notes "Download **Snap.dmg**, drag Snap to Applications. First launch: System Settings → Privacy & Security → **Open Anyway**, then allow Screen Recording. Shortcuts: ⌥⌘S area/window, ⌥⌘F full screen."
+
+      - name: Remove signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
