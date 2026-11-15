@@ -13,7 +13,7 @@ jobs:
     permissions:
       contents: write # create releases on tags
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Select newest Xcode
         run: |
@@ -55,7 +55,7 @@ jobs:
           ./build.sh dmg
           codesign -dvv build/Snap.app 2>&1 | grep -E "^(Authority|Signature)" || true
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: Snap
           path: build/Snap.dmg
